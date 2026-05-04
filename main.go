@@ -76,26 +76,35 @@ type clipMessage struct {
 	Text   string `json:"text"`
 }
 
-// state holds the gate flag that suppresses the echo push after a remote
+// echoWindow is how long after a remote clipboard write we suppress the
+// echo push. The clipboard-change event fires within tens of ms; 500ms
+// gives ample margin on a loaded system while being short enough that a
+// real user copy half a second later is never affected.
+const echoWindow = 500 * time.Millisecond
+
+// state holds the gate that suppresses the echo push after a remote
 // clipboard write. When the daemon receives a message and sets the local
-// clipboard, the next push from the socket is skipped because it is the
-// clipboard-change event triggered by that same write, not a user copy.
+// clipboard, the resulting clipboard-change event triggers a push from
+// the external hook — that push should be dropped. The gate expires
+// automatically after echoWindow so a stuck flag never silently swallows
+// a real user copy (e.g. when clipboard content was unchanged and no
+// change event fires at all).
 type state struct {
-	mu         sync.Mutex
-	ignoreNext bool
+	mu          sync.Mutex
+	ignoreUntil time.Time
 }
 
 func (s *state) setIgnoreNext() {
 	s.mu.Lock()
-	s.ignoreNext = true
+	s.ignoreUntil = time.Now().Add(echoWindow)
 	s.mu.Unlock()
 }
 
 func (s *state) checkAndClear() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.ignoreNext {
-		s.ignoreNext = false
+	if time.Now().Before(s.ignoreUntil) {
+		s.ignoreUntil = time.Time{}
 		return true
 	}
 	return false

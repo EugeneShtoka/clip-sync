@@ -15,7 +15,7 @@ import (
 
 // --- state gate ---
 
-func TestState_ignoreNextFalseByDefault(t *testing.T) {
+func TestState_falseByDefault(t *testing.T) {
 	s := &state{}
 	if s.checkAndClear() {
 		t.Fatal("should not ignore by default")
@@ -26,10 +26,19 @@ func TestState_setThenClear(t *testing.T) {
 	s := &state{}
 	s.setIgnoreNext()
 	if !s.checkAndClear() {
-		t.Fatal("should ignore after setIgnoreNext")
+		t.Fatal("should ignore within window")
 	}
 	if s.checkAndClear() {
 		t.Fatal("flag should be cleared after first check")
+	}
+}
+
+func TestState_expiresAfterWindow(t *testing.T) {
+	s := &state{}
+	s.setIgnoreNext()
+	time.Sleep(echoWindow + 20*time.Millisecond)
+	if s.checkAndClear() {
+		t.Fatal("flag should have expired after echoWindow")
 	}
 }
 

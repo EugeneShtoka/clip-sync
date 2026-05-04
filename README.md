@@ -6,10 +6,24 @@ Clipboard changes are pushed to an ntfy topic and received from it in real time 
 
 ## How it works
 
-- A daemon process listens on a Unix socket and subscribes to an ntfy topic via WebSocket
-- When the clipboard changes, a client tool sends the text to the daemon via the socket
-- The daemon deduplicates and publishes to ntfy
-- Incoming ntfy messages are written back to the local clipboard
+- A daemon listens on a Unix socket and subscribes to an ntfy topic via WebSocket
+- When the clipboard changes, a client sends the text to the daemon via the socket
+- The daemon wraps it in a JSON envelope and publishes to ntfy
+- Incoming messages are parsed, filtered by source, and written to the local clipboard
+- A gate flag suppresses the echo: after writing a received clipboard, the next push is skipped
+
+### Message format
+
+All messages are JSON:
+
+```json
+{ "source": "laptop", "text": "clipboard content" }
+```
+
+- **source** — identifies the sending device. Receivers skip messages where `source` matches their own, preventing feedback loops. Configure per-device; defaults to hostname.
+- **text** — raw clipboard content. JSON encoding preserves newlines, quotes, and special characters exactly.
+
+This format is designed for interoperability — any device (Tasker, Python script, another clip-sync instance) can participate by producing and consuming the same JSON envelope.
 
 ## Installation
 

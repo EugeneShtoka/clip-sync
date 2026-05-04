@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,6 +25,7 @@ type fileConfig struct {
 	Ntfy          string `toml:"ntfy"`
 	Topic         string `toml:"topic"`
 	Socket        string `toml:"socket"`
+	Source        string `toml:"source"`        // identifies this device; defaults to hostname
 	PersistServer bool   `toml:"persist_server"` // if false, server won't cache the message (X-Cache: no)
 	PersistPhone  bool   `toml:"persist_phone"`  // if false, Android won't save to notification history (X-Persist: no)
 }
@@ -46,19 +46,58 @@ func loadFileConfig(path string) (fileConfig, error) {
 	return cfg, nil
 }
 
-type state struct {
-	mu       sync.Mutex
-	lastHash [32]byte
+func resolveSource(configured string) string {
+	if configured != "" {
+		return configured
+	}
+	h, err := os.Hostname()
+	if err != nil {
+		return "unknown"
+	}
+	return h
 }
 
-func (s *state) same(text string) bool {
-	h := sha256.Sum256([]byte(text))
+// clipMessage is the JSON envelope used for all clipboard transmissions.
+// All devices on the same topic must use this format.
+//
+// Schema:
+//
+//	{ "source": "<device-name>", "text": "<clipboard content>" }
+//
+// source: identifies the sending device (e.g. "laptop", "pixel9", or hostname).
+//
+//	Receivers skip messages where source matches their own, preventing loops.
+//
+// text:   the raw clipboard content. JSON encoding preserves special characters,
+//
+//	newlines, and quotes exactly.
+type clipMessage struct {
+	Source string `json:"source"`
+	Text   string `json:"text"`
+}
+
+// state holds the gate flag that suppresses the echo push after a remote
+// clipboard write. When the daemon receives a message and sets the local
+// clipboard, the next push from the socket is skipped because it is the
+// clipboard-change event triggered by that same write, not a user copy.
+type state struct {
+	mu         sync.Mutex
+	ignoreNext bool
+}
+
+func (s *state) setIgnoreNext() {
+	s.mu.Lock()
+	s.ignoreNext = true
+	s.mu.Unlock()
+}
+
+func (s *state) checkAndClear() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if h == s.lastHash {
+	if s.ignoreNext {
+		s.ignoreNext = false
 		return true
 	}
-	s.lastHash = h
 	return false
 }
 
@@ -78,14 +117,19 @@ func setClipboard(text string) {
 	}
 }
 
-func pushToNtfy(ntfyURL, topic, text string, persistServer, persistPhone bool) {
+func pushToNtfy(ntfyURL, topic, source, text string, persistServer, persistPhone bool) {
+	body, err := json.Marshal(clipMessage{Source: source, Text: text})
+	if err != nil {
+		log.Printf("ntfy push: marshal: %v", err)
+		return
+	}
 	url := strings.TrimRight(ntfyURL, "/") + "/" + topic
-	req, err := http.NewRequest("POST", url, strings.NewReader(text))
+	req, err := http.NewRequest("POST", url, strings.NewReader(string(body)))
 	if err != nil {
 		log.Printf("ntfy push: %v", err)
 		return
 	}
-	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("Content-Type", "application/json")
 	if !persistServer {
 		req.Header.Set("X-Cache", "no")
 	}
@@ -112,7 +156,7 @@ type ntfyEvent struct {
 	Message string `json:"message"`
 }
 
-func subscribeLoop(ntfyURL, topic string, s *state) {
+func subscribeLoop(ntfyURL, topic, source string, s *state) {
 	url := toWSURL(ntfyURL, topic)
 	for {
 		conn, _, err := websocket.DefaultDialer.Dial(url, nil)
@@ -134,16 +178,22 @@ func subscribeLoop(ntfyURL, topic string, s *state) {
 			if err := json.Unmarshal(data, &ev); err != nil || ev.Event != "message" || ev.Message == "" {
 				continue
 			}
-			if s.same(ev.Message) {
+			var msg clipMessage
+			if err := json.Unmarshal([]byte(ev.Message), &msg); err != nil || msg.Text == "" {
+				log.Printf("ws: ignoring non-JSON or empty message")
 				continue
 			}
-			setClipboard(ev.Message)
-			log.Printf("← %d bytes", len(ev.Message))
+			if msg.Source == source {
+				continue // own message echoed back, skip
+			}
+			setClipboard(msg.Text)
+			s.setIgnoreNext()
+			log.Printf("← %d bytes from %s", len(msg.Text), msg.Source)
 		}
 	}
 }
 
-func runDaemon(ntfyURL, topic, socket string, persistServer, persistPhone bool) {
+func runDaemon(ntfyURL, topic, socket, source string, persistServer, persistPhone bool) {
 	os.Remove(socket)
 	l, err := net.Listen("unix", socket)
 	if err != nil {
@@ -161,9 +211,9 @@ func runDaemon(ntfyURL, topic, socket string, persistServer, persistPhone bool) 
 
 	s := &state{}
 
-	go subscribeLoop(ntfyURL, topic, s)
+	go subscribeLoop(ntfyURL, topic, source, s)
 
-	log.Printf("daemon: socket=%s ntfy=%s/%s", socket, ntfyURL, topic)
+	log.Printf("daemon: socket=%s ntfy=%s/%s source=%s", socket, ntfyURL, topic, source)
 
 	for {
 		conn, err := l.Accept()
@@ -176,11 +226,12 @@ func runDaemon(ntfyURL, topic, socket string, persistServer, persistPhone bool) 
 			if err != nil || len(data) == 0 {
 				return
 			}
-			text := string(data)
-			if s.same(text) {
+			if s.checkAndClear() {
+				log.Printf("skip: echo of received clipboard")
 				return
 			}
-			pushToNtfy(ntfyURL, topic, text, persistServer, persistPhone)
+			text := string(data)
+			pushToNtfy(ntfyURL, topic, source, text, persistServer, persistPhone)
 			log.Printf("→ %d bytes", len(text))
 		}(conn)
 	}
@@ -204,35 +255,36 @@ func main() {
 	ntfyFlag   := flag.String("ntfy", "", "ntfy base URL, e.g. https://ntfy.example.com")
 	topicFlag  := flag.String("topic", "", "ntfy topic name")
 	socketFlag := flag.String("socket", "", "Unix socket path")
+	sourceFlag := flag.String("source", "", "device identifier (default: hostname)")
 	pushMode   := flag.Bool("push", false, "push current clipboard to daemon and exit")
 	flag.Parse()
 
-	// track which flags were explicitly set on the command line
 	explicit := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 
-	// defaults
 	cfg := fileConfig{
 		Topic:  "clipboard",
 		Socket: "/tmp/clip-sync.sock",
 	}
 
-	// load config file if it exists
 	if *configFile != "" {
 		if fc, err := loadFileConfig(*configFile); err == nil {
 			if fc.Ntfy != ""   { cfg.Ntfy = fc.Ntfy }
 			if fc.Topic != ""  { cfg.Topic = fc.Topic }
 			if fc.Socket != "" { cfg.Socket = fc.Socket }
+			if fc.Source != "" { cfg.Source = fc.Source }
+			cfg.PersistServer = fc.PersistServer
+			cfg.PersistPhone  = fc.PersistPhone
 		} else if explicit["config"] {
 			fmt.Fprintf(os.Stderr, "clip-sync: config file: %v\n", err)
 			os.Exit(1)
 		}
 	}
 
-	// CLI flags override config file
 	if explicit["ntfy"]   { cfg.Ntfy = *ntfyFlag }
 	if explicit["topic"]  { cfg.Topic = *topicFlag }
 	if explicit["socket"] { cfg.Socket = *socketFlag }
+	if explicit["source"] { cfg.Source = *sourceFlag }
 
 	if *pushMode {
 		runPush(cfg.Socket)
@@ -245,5 +297,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	runDaemon(cfg.Ntfy, cfg.Topic, cfg.Socket, cfg.PersistServer, cfg.PersistPhone)
+	source := resolveSource(cfg.Source)
+	runDaemon(cfg.Ntfy, cfg.Topic, cfg.Socket, source, cfg.PersistServer, cfg.PersistPhone)
 }

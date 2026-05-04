@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -12,50 +13,36 @@ import (
 	"time"
 )
 
-// --- state.same ---
+// --- state gate ---
 
-func TestStateSame_firstCallFalse(t *testing.T) {
+func TestState_ignoreNextFalseByDefault(t *testing.T) {
 	s := &state{}
-	if s.same("hello") {
-		t.Fatal("first call should return false")
+	if s.checkAndClear() {
+		t.Fatal("should not ignore by default")
 	}
 }
 
-func TestStateSame_duplicateTrue(t *testing.T) {
+func TestState_setThenClear(t *testing.T) {
 	s := &state{}
-	s.same("hello")
-	if !s.same("hello") {
-		t.Fatal("duplicate should return true")
+	s.setIgnoreNext()
+	if !s.checkAndClear() {
+		t.Fatal("should ignore after setIgnoreNext")
+	}
+	if s.checkAndClear() {
+		t.Fatal("flag should be cleared after first check")
 	}
 }
 
-func TestStateSame_differentFalse(t *testing.T) {
-	s := &state{}
-	s.same("hello")
-	if s.same("world") {
-		t.Fatal("different text should return false")
-	}
-}
-
-func TestStateSame_emptyString(t *testing.T) {
-	s := &state{}
-	if s.same("") {
-		t.Fatal("first empty string should return false")
-	}
-	if !s.same("") {
-		t.Fatal("second empty string should return true")
-	}
-}
-
-func TestStateSame_concurrent(t *testing.T) {
+func TestState_concurrent(t *testing.T) {
 	s := &state{}
 	var wg sync.WaitGroup
-	for i := range 50 {
+	for range 50 {
 		wg.Add(1)
-		go func(i int) {
+		go func() {
 			defer wg.Done()
-			s.same(fmt.Sprintf("text-%d", i))
-		}(i)
+			s.setIgnoreNext()
+			s.checkAndClear()
+		}()
 	}
 	wg.Wait()
 }
@@ -94,29 +81,45 @@ func TestToWSURL_customTopic(t *testing.T) {
 	}
 }
 
+// --- resolveSource ---
+
+func TestResolveSource_usesConfigured(t *testing.T) {
+	got := resolveSource("mydevice")
+	if got != "mydevice" {
+		t.Fatalf("got %q, want %q", got, "mydevice")
+	}
+}
+
+func TestResolveSource_fallsBackToHostname(t *testing.T) {
+	hostname, _ := os.Hostname()
+	got := resolveSource("")
+	if got != hostname {
+		t.Fatalf("got %q, want hostname %q", got, hostname)
+	}
+}
+
 // --- pushToNtfy ---
 
-func TestPushToNtfy_correctURLAndBody(t *testing.T) {
-	var gotPath, gotBody string
+func TestPushToNtfy_jsonEnvelope(t *testing.T) {
+	var got clipMessage
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
 		b, _ := io.ReadAll(r.Body)
-		gotBody = string(b)
+		json.Unmarshal(b, &got)
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
 
-	pushToNtfy(srv.URL, "clipboard", "hello world", false, false)
+	pushToNtfy(srv.URL, "clipboard", "laptop", "hello world", false, false)
 
-	if gotPath != "/clipboard" {
-		t.Fatalf("path: got %q, want %q", gotPath, "/clipboard")
+	if got.Source != "laptop" {
+		t.Fatalf("source: got %q, want %q", got.Source, "laptop")
 	}
-	if gotBody != "hello world" {
-		t.Fatalf("body: got %q, want %q", gotBody, "hello world")
+	if got.Text != "hello world" {
+		t.Fatalf("text: got %q, want %q", got.Text, "hello world")
 	}
 }
 
-func TestPushToNtfy_trailingSlashInURL(t *testing.T) {
+func TestPushToNtfy_correctPath(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
@@ -124,18 +127,53 @@ func TestPushToNtfy_trailingSlashInURL(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	pushToNtfy(srv.URL+"/", "clipboard", "x", false, false)
+	pushToNtfy(srv.URL+"/", "clipboard", "laptop", "x", false, false)
 
 	if gotPath != "/clipboard" {
 		t.Fatalf("path: got %q, want %q", gotPath, "/clipboard")
 	}
 }
 
+func TestPushToNtfy_noCacheHeader(t *testing.T) {
+	var cacheHdr, persistHdr string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cacheHdr = r.Header.Get("X-Cache")
+		persistHdr = r.Header.Get("X-Persist")
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	pushToNtfy(srv.URL, "clipboard", "laptop", "x", false, false)
+
+	if cacheHdr != "no" {
+		t.Fatalf("X-Cache: got %q, want %q", cacheHdr, "no")
+	}
+	if persistHdr != "no" {
+		t.Fatalf("X-Persist: got %q, want %q", persistHdr, "no")
+	}
+}
+
+func TestPushToNtfy_persistHeaders(t *testing.T) {
+	var cacheHdr, persistHdr string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cacheHdr = r.Header.Get("X-Cache")
+		persistHdr = r.Header.Get("X-Persist")
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	pushToNtfy(srv.URL, "clipboard", "laptop", "x", true, true)
+
+	if cacheHdr != "" {
+		t.Fatalf("X-Cache should be absent when persist_server=true, got %q", cacheHdr)
+	}
+	if persistHdr != "" {
+		t.Fatalf("X-Persist should be absent when persist_phone=true, got %q", persistHdr)
+	}
+}
+
 // --- socket → ntfy integration ---
 
-// socketDaemon spins up a Unix socket that accepts one connection,
-// reads the text, checks dedup via s, then calls onPush if not a dup.
-// Closes after receiving `count` connections.
 func socketDaemon(t *testing.T, socketPath string, s *state, onPush func(string), count int) {
 	t.Helper()
 	os.Remove(socketPath)
@@ -159,11 +197,10 @@ func socketDaemon(t *testing.T, socketPath string, s *state, onPush func(string)
 				if len(data) == 0 {
 					return
 				}
-				text := string(data)
-				if s.same(text) {
+				if s.checkAndClear() {
 					return
 				}
-				onPush(text)
+				onPush(string(data))
 			}()
 		}
 	}()
@@ -220,59 +257,46 @@ func TestSocket_pushesTextToNtfy(t *testing.T) {
 	socket := t.TempDir() + "/clip-sync.sock"
 	s := &state{}
 	socketDaemon(t, socket, s, func(text string) {
-		pushToNtfy(srv.URL, "clipboard", text, false, false)
+		pushToNtfy(srv.URL, "clipboard", "laptop", text, false, false)
 	}, 1)
 
 	sendToSocket(t, socket, "hello")
 
 	got := waitPushes(t, ch, 1)
-	if got[0] != "hello" {
-		t.Fatalf("got %q, want %q", got[0], "hello")
+	var msg clipMessage
+	json.Unmarshal([]byte(got[0]), &msg)
+	if msg.Text != "hello" {
+		t.Fatalf("text: got %q, want %q", msg.Text, "hello")
+	}
+	if msg.Source != "laptop" {
+		t.Fatalf("source: got %q, want %q", msg.Source, "laptop")
 	}
 }
 
-func TestSocket_dedup_sameTextNotPushedTwice(t *testing.T) {
+func TestSocket_ignoreNextSkipsEcho(t *testing.T) {
 	ch := make(chan string, 2)
 	srv := ntfyCollector(t, ch)
 	defer srv.Close()
 
 	socket := t.TempDir() + "/clip-sync.sock"
 	s := &state{}
+	s.setIgnoreNext()
 	socketDaemon(t, socket, s, func(text string) {
-		pushToNtfy(srv.URL, "clipboard", text, false, false)
+		pushToNtfy(srv.URL, "clipboard", "laptop", text, false, false)
 	}, 2)
 
-	sendToSocket(t, socket, "hello")
-	sendToSocket(t, socket, "hello")
+	sendToSocket(t, socket, "echo") // should be skipped
+	sendToSocket(t, socket, "real") // should go through
 
-	// expect exactly 1 push; wait briefly to confirm the second doesn't arrive
 	got := waitPushes(t, ch, 1)
-	if got[0] != "hello" {
-		t.Fatalf("got %q, want %q", got[0], "hello")
+	var msg clipMessage
+	json.Unmarshal([]byte(got[0]), &msg)
+	if msg.Text != "real" {
+		t.Fatalf("expected only 'real' to be pushed, got %q", msg.Text)
 	}
 	select {
 	case extra := <-ch:
-		t.Fatalf("unexpected second push: %q", extra)
+		t.Fatalf("unexpected extra push: %q", extra)
 	case <-time.After(100 * time.Millisecond):
-	}
-}
-
-func TestSocket_dedup_differentTextPushedTwice(t *testing.T) {
-	ch := make(chan string, 2)
-	srv := ntfyCollector(t, ch)
-	defer srv.Close()
-
-	socket := t.TempDir() + "/clip-sync.sock"
-	s := &state{}
-	socketDaemon(t, socket, s, func(text string) {
-		pushToNtfy(srv.URL, "clipboard", text, false, false)
-	}, 2)
-
-	sendToSocket(t, socket, "hello")
-	sendToSocket(t, socket, "world")
-
-	got := waitPushes(t, ch, 2)
-	if len(got) != 2 {
-		t.Fatalf("expected 2 pushes, got %v", got)
 	}
 }

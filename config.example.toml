@@ -2,6 +2,11 @@ ntfy   = "https://ntfy.example.com"
 topic  = "clipboard"
 socket = "/tmp/clip-sync.sock"  # optional, this is the default
 
+# Device identifier included in every message. Other devices use this to
+# filter out their own messages and prevent loops.
+# Defaults to the system hostname if not set.
+source = "laptop"
+
 # Whether to persist messages on the server (ntfy cache).
 # When false, sends X-Cache: no — message is delivered but not stored server-side.
 persist_server = false

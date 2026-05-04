@@ -1,0 +1,11 @@
+ntfy   = "https://ntfy.example.com"
+topic  = "clipboard"
+socket = "/tmp/clip-sync.sock"  # optional, this is the default
+
+# Whether to persist messages on the server (ntfy cache).
+# When false, sends X-Cache: no — message is delivered but not stored server-side.
+persist_server = false
+
+# Whether to persist messages in Android notification history.
+# When false, sends X-Persist: no — notification is shown but not saved locally.
+persist_phone = false

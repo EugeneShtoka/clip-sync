@@ -1,0 +1,13 @@
+# Binary
+clip-sync
+
+# Go test / build artifacts
+*.test
+*.out
+
+# Vim swap files
+*.swp
+*.swo
+
+# Claude Code session data
+.claude/
